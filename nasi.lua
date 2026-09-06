@@ -10,8 +10,19 @@ local API_KEY = "NasiEggPort"
 local TAB_NAME = "Nasi Egg"
 local ID = "nasi_egg_"
 
-if env and type(env[API_KEY]) == "table" and type(env[API_KEY].Stop) == "function" then
-    pcall(env[API_KEY].Stop)
+local PRIOR_API_KEYS = {
+    "NasiEggPort",
+    "NightHubEggPort",
+    "SpeedHubXEggPort",
+    "StealAnEgg",
+    "EggStealer"
+}
+
+for _, key in ipairs(PRIOR_API_KEYS) do
+    local oldApi = env and env[key]
+    if type(oldApi) == "table" and type(oldApi.Stop) == "function" then
+        pcall(oldApi.Stop)
+    end
 end
 
 local Players = game:GetService("Players")
@@ -31,6 +42,7 @@ local lastSlotCache = 0
 local lastUiPrint = 0
 local lastAntiAfk = 0
 local busy = false
+local usingWabiUi = false
 
 local BASEPART_CLASSES = {
     Part = true,
@@ -67,6 +79,7 @@ local state = {
     AutoFeed = false,
     NoClip = false,
     AntiAfk = false,
+    Radar = true,
     FilterIndex = 1,
     Speed = 650,
     ReturnX = 535,
@@ -78,7 +91,8 @@ local state = {
     Status = "Idle",
     Target = "None",
     Total = 0,
-    LastError = "None"
+    LastError = "None",
+    RadarTargets = 0
 }
 
 local function addConn(conn)
@@ -154,6 +168,9 @@ local function readComboIndex(name, options, defaultIndex)
 end
 
 local function syncSettings()
+    if usingWabiUi then
+        return
+    end
     local oldAuto = state.AutoFarm
     state.AutoFarm = readUiBool("auto", state.AutoFarm)
     state.ForFriends = readUiBool("friends", state.ForFriends)
@@ -534,6 +551,344 @@ local function bestEgg()
     return best
 end
 
+local RADAR_DOT_LIMIT = 64
+local radarReady = false
+local radarWarned = false
+local radarObjects = {}
+local radarDots = {}
+local radarBase = {}
+
+local radarColors = {
+    Background = Color3.fromRGB(12, 16, 22),
+    Border = Color3.fromRGB(78, 101, 128),
+    Grid = Color3.fromRGB(46, 62, 82),
+    Text = Color3.fromRGB(226, 235, 244),
+    Muted = Color3.fromRGB(144, 158, 177),
+    Player = Color3.fromRGB(96, 205, 255),
+    Normal = Color3.fromRGB(154, 165, 182),
+    Ultra = Color3.fromRGB(214, 129, 255),
+    Giant = Color3.fromRGB(255, 196, 87),
+    Mutation = Color3.fromRGB(70, 230, 205),
+    Parasite = Color3.fromRGB(120, 230, 126),
+    Target = Color3.fromRGB(255, 245, 165),
+    Dim = Color3.fromRGB(82, 93, 112)
+}
+
+local function setDraw(obj, prop, value)
+    if obj then
+        pcall(function()
+            obj[prop] = value
+        end)
+    end
+end
+
+local function addDraw(kind, props)
+    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
+        return nil
+    end
+    local ok, obj = pcall(function()
+        return Drawing.new(kind)
+    end)
+    if not ok or not obj then
+        return nil
+    end
+    radarObjects[#radarObjects + 1] = obj
+    if props then
+        for prop, value in pairs(props) do
+            setDraw(obj, prop, value)
+        end
+    end
+    return obj
+end
+
+local function ensureRadar()
+    if radarReady then
+        return true
+    end
+    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
+        if not radarWarned then
+            radarWarned = true
+            print("[" .. SCRIPT_TITLE .. "] radar unavailable: Drawing.new missing")
+        end
+        return false
+    end
+
+    radarBase.bg = addDraw("Square", {
+        Filled = true,
+        Color = radarColors.Background,
+        Transparency = 0.16,
+        Rounding = 8,
+        ZIndex = 76,
+        Visible = false
+    })
+    radarBase.border = addDraw("Square", {
+        Filled = false,
+        Thickness = 1,
+        Color = radarColors.Border,
+        Transparency = 0,
+        Rounding = 8,
+        ZIndex = 77,
+        Visible = false
+    })
+    radarBase.inner = addDraw("Square", {
+        Filled = false,
+        Thickness = 1,
+        Color = radarColors.Grid,
+        Transparency = 0.18,
+        ZIndex = 78,
+        Visible = false
+    })
+    radarBase.header = addDraw("Text", {
+        Size = 13,
+        Font = 2,
+        Outline = true,
+        Color = radarColors.Text,
+        ZIndex = 79,
+        Visible = false
+    })
+    radarBase.sub = addDraw("Text", {
+        Size = 11,
+        Font = 1,
+        Outline = true,
+        Color = radarColors.Muted,
+        ZIndex = 79,
+        Visible = false
+    })
+    radarBase.footer = addDraw("Text", {
+        Size = 11,
+        Font = 1,
+        Outline = true,
+        Color = radarColors.Muted,
+        ZIndex = 79,
+        Visible = false
+    })
+    radarBase.player = addDraw("Circle", {
+        Radius = 4,
+        NumSides = 24,
+        Filled = true,
+        Color = radarColors.Player,
+        Transparency = 0,
+        ZIndex = 82,
+        Visible = false
+    })
+    radarBase.targetLine = addDraw("Line", {
+        Thickness = 1,
+        Color = radarColors.Target,
+        Transparency = 0.18,
+        ZIndex = 80,
+        Visible = false
+    })
+    radarBase.grid = {}
+    for i = 1, 5 do
+        radarBase.grid[i] = addDraw("Line", {
+            Thickness = 1,
+            Color = radarColors.Grid,
+            Transparency = 0.3,
+            ZIndex = 78,
+            Visible = false
+        })
+    end
+    for i = 1, RADAR_DOT_LIMIT do
+        radarDots[i] = addDraw("Circle", {
+            Radius = 2.5,
+            NumSides = 18,
+            Filled = true,
+            Color = radarColors.Normal,
+            Transparency = 0,
+            ZIndex = 81,
+            Visible = false
+        })
+    end
+
+    radarReady = radarBase.bg ~= nil
+    return radarReady
+end
+
+local function hideRadar()
+    for _, obj in ipairs(radarObjects) do
+        setDraw(obj, "Visible", false)
+    end
+end
+
+local function removeRadar()
+    for _, obj in ipairs(radarObjects) do
+        pcall(function()
+            obj:Remove()
+        end)
+    end
+    clear(radarObjects)
+    clear(radarDots)
+    clear(radarBase)
+    radarReady = false
+end
+
+local function bestEggFromCache()
+    local best = nil
+    local bestScore = -math.huge
+    for _, egg in ipairs(slotCache) do
+        if egg and egg.slot and egg.slot.Parent and egg.part and egg.part.Parent and eligible(egg) then
+            if egg.score > bestScore then
+                bestScore = egg.score
+                best = egg
+            end
+        end
+    end
+    return best
+end
+
+local function colorForEgg(egg, isTarget)
+    if isTarget then return radarColors.Target end
+    if egg.ultra then return radarColors.Ultra end
+    if egg.giant then return radarColors.Giant end
+    if egg.mutation then return radarColors.Mutation end
+    if egg.parasite then return radarColors.Parasite end
+    if not eligible(egg) then return radarColors.Dim end
+    return radarColors.Normal
+end
+
+local function mapRadarPoint(pos, minX, maxX, minZ, maxZ, x, y, w, h)
+    local sx = (pos.X - minX) / math.max(1, maxX - minX)
+    local sz = (pos.Z - minZ) / math.max(1, maxZ - minZ)
+    sx = clamp(sx, 0, 1)
+    sz = clamp(sz, 0, 1)
+    return Vector2.new(x + sx * w, y + h - sz * h)
+end
+
+local function renderRadar()
+    if not running then
+        hideRadar()
+        return
+    end
+    if not state.Radar then
+        hideRadar()
+        return
+    end
+    if not ensureRadar() then
+        return
+    end
+
+    local cam = Workspace.CurrentCamera
+    local viewport = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    local panelW = 232
+    local panelH = 174
+    local panelX = math.max(12, viewport.X - panelW - 18)
+    local panelY = 92
+    local mapX = panelX + 12
+    local mapY = panelY + 34
+    local mapW = panelW - 24
+    local mapH = panelH - 62
+
+    local _, root = getCharParts()
+    local playerPos = root and root.Position or Vector3.new(state.ReturnX, state.SafeY, state.RouteZ)
+    local minX = playerPos.X
+    local maxX = playerPos.X
+    local minZ = playerPos.Z
+    local maxZ = playerPos.Z
+    local count = 0
+
+    for _, egg in ipairs(slotCache) do
+        if egg and egg.slot and egg.slot.Parent and egg.part and egg.part.Parent and egg.position then
+            count = count + 1
+            local pos = egg.position
+            minX = math.min(minX, pos.X)
+            maxX = math.max(maxX, pos.X)
+            minZ = math.min(minZ, pos.Z)
+            maxZ = math.max(maxZ, pos.Z)
+        end
+    end
+
+    if maxX - minX < 700 then
+        local mid = (minX + maxX) * 0.5
+        minX = mid - 350
+        maxX = mid + 350
+    end
+    if maxZ - minZ < 150 then
+        local mid = (minZ + maxZ) * 0.5
+        minZ = mid - 75
+        maxZ = mid + 75
+    end
+    minX = minX - 85
+    maxX = maxX + 85
+    minZ = minZ - 20
+    maxZ = maxZ + 20
+
+    local playerPoint = mapRadarPoint(playerPos, minX, maxX, minZ, maxZ, mapX, mapY, mapW, mapH)
+    local best = bestEggFromCache()
+    state.RadarTargets = count
+
+    setDraw(radarBase.bg, "Position", Vector2.new(panelX, panelY))
+    setDraw(radarBase.bg, "Size", Vector2.new(panelW, panelH))
+    setDraw(radarBase.bg, "Visible", true)
+    setDraw(radarBase.border, "Position", Vector2.new(panelX, panelY))
+    setDraw(radarBase.border, "Size", Vector2.new(panelW, panelH))
+    setDraw(radarBase.border, "Visible", true)
+    setDraw(radarBase.inner, "Position", Vector2.new(mapX, mapY))
+    setDraw(radarBase.inner, "Size", Vector2.new(mapW, mapH))
+    setDraw(radarBase.inner, "Visible", true)
+
+    setDraw(radarBase.header, "Text", "EGG RADAR  |  " .. tostring(count))
+    setDraw(radarBase.header, "Position", Vector2.new(panelX + 12, panelY + 10))
+    setDraw(radarBase.header, "Visible", true)
+    setDraw(radarBase.sub, "Text", tostring(filters[state.FilterIndex] or "Total Sweep"))
+    setDraw(radarBase.sub, "Position", Vector2.new(panelX + 124, panelY + 12))
+    setDraw(radarBase.sub, "Visible", true)
+
+    local gx = radarBase.grid
+    if gx then
+        local midX = mapX + mapW * 0.5
+        local midY = mapY + mapH * 0.5
+        setDraw(gx[1], "From", Vector2.new(midX, mapY))
+        setDraw(gx[1], "To", Vector2.new(midX, mapY + mapH))
+        setDraw(gx[2], "From", Vector2.new(mapX, midY))
+        setDraw(gx[2], "To", Vector2.new(mapX + mapW, midY))
+        setDraw(gx[3], "From", Vector2.new(mapX + mapW * 0.25, mapY))
+        setDraw(gx[3], "To", Vector2.new(mapX + mapW * 0.25, mapY + mapH))
+        setDraw(gx[4], "From", Vector2.new(mapX + mapW * 0.75, mapY))
+        setDraw(gx[4], "To", Vector2.new(mapX + mapW * 0.75, mapY + mapH))
+        setDraw(gx[5], "From", Vector2.new(mapX, mapY + mapH * 0.25))
+        setDraw(gx[5], "To", Vector2.new(mapX + mapW, mapY + mapH * 0.25))
+        for i = 1, 5 do
+            setDraw(gx[i], "Visible", true)
+        end
+    end
+
+    setDraw(radarBase.player, "Position", playerPoint)
+    setDraw(radarBase.player, "Visible", true)
+
+    if best and best.position then
+        local targetPoint = mapRadarPoint(best.position, minX, maxX, minZ, maxZ, mapX, mapY, mapW, mapH)
+        setDraw(radarBase.targetLine, "From", playerPoint)
+        setDraw(radarBase.targetLine, "To", targetPoint)
+        setDraw(radarBase.targetLine, "Visible", true)
+        local dist = (best.position - playerPos).Magnitude
+        setDraw(radarBase.footer, "Text", "target: " .. tostring(best.label) .. "  " .. string.format("%.0f", dist) .. "m")
+    else
+        setDraw(radarBase.targetLine, "Visible", false)
+        setDraw(radarBase.footer, "Text", count > 0 and "no eligible target" or "scanning eggs")
+    end
+    setDraw(radarBase.footer, "Position", Vector2.new(panelX + 12, panelY + panelH - 20))
+    setDraw(radarBase.footer, "Visible", true)
+
+    local used = 0
+    for _, egg in ipairs(slotCache) do
+        if used >= RADAR_DOT_LIMIT then break end
+        if egg and egg.slot and egg.slot.Parent and egg.part and egg.part.Parent and egg.position then
+            used = used + 1
+            local dot = radarDots[used]
+            local isTarget = egg == best
+            local pos = mapRadarPoint(egg.position, minX, maxX, minZ, maxZ, mapX, mapY, mapW, mapH)
+            setDraw(dot, "Position", pos)
+            setDraw(dot, "Radius", isTarget and 4.5 or (egg.giant and 3.7 or 2.6))
+            setDraw(dot, "Color", colorForEgg(egg, isTarget))
+            setDraw(dot, "Transparency", eligible(egg) and 0 or 0.42)
+            setDraw(dot, "Visible", true)
+        end
+    end
+    for i = used + 1, RADAR_DOT_LIMIT do
+        setDraw(radarDots[i], "Visible", false)
+    end
+end
+
 local function moveTo(target, radius, timeout, landing)
     local start = tick()
     radius = radius or 6
@@ -769,7 +1124,7 @@ local api = {
     Stop = stop,
     Scan = scanOnce,
     Diag = function()
-        return string.format("script=%s running=%s auto=%s filter=%s slots=%d status=%s target=%s total=%d err=%s", SCRIPT_TITLE, tostring(running), tostring(state.AutoFarm), tostring(filters[state.FilterIndex] or state.FilterIndex), #slotCache, tostring(state.Status), tostring(state.Target), tonumber(state.Total) or 0, tostring(state.LastError))
+        return string.format("script=%s running=%s auto=%s radar=%s filter=%s slots=%d radarTargets=%d status=%s target=%s total=%d err=%s", SCRIPT_TITLE, tostring(running), tostring(state.AutoFarm), tostring(state.Radar), tostring(filters[state.FilterIndex] or state.FilterIndex), #slotCache, tonumber(state.RadarTargets) or 0, tostring(state.Status), tostring(state.Target), tonumber(state.Total) or 0, tostring(state.LastError))
     end
 }
 
@@ -861,6 +1216,7 @@ local function setupWabiUi()
     end
 
     wabiLibrary = lib
+    usingWabiUi = true
     local ok, err = pcall(function()
         wabiWindow = lib:CreateWindow({
             Title = SCRIPT_TITLE,
@@ -945,6 +1301,17 @@ local function setupWabiUi()
                 state.AntiAfk = value == true
             end,
         })
+        controls.radar = misc:AddToggle({
+            Id = ID .. "radar",
+            Title = "Egg Radar",
+            Default = true,
+            Callback = function(value)
+                state.Radar = value == true
+                if not state.Radar then
+                    hideRadar()
+                end
+            end,
+        })
         misc:AddButton({
             Title = "Print Status",
             Description = "Shows current script state in logs",
@@ -978,6 +1345,7 @@ end
 setupWabiUi()
 
 addConn(RunService.Heartbeat:Connect(heartbeat))
+addConn(RunService.RenderStepped:Connect(renderRadar))
 addConn(UserInputService.InputBegan:Connect(function(input)
     if not running or type(input) ~= "table" then return end
     local key = input.KeyCode
@@ -992,6 +1360,18 @@ addConn(UserInputService.InputBegan:Connect(function(input)
         else
             setAuto(value)
         end
+    elseif key == 82 or key == 114 then
+        local value = not state.Radar
+        state.Radar = value
+        if controls.radar and type(controls.radar.SetValue) == "function" then
+            pcall(function()
+                controls.radar:SetValue(value)
+            end)
+        end
+        if not state.Radar then
+            hideRadar()
+        end
+        say("Egg Radar", state.Radar and "shown" or "hidden", 2)
     end
 end))
 
