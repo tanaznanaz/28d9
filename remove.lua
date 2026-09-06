@@ -55,10 +55,11 @@ local function stopObject(obj, label)
         obj.Running = false
         obj.Enabled = false
     end)
-    safeCall(obj.Stop, nil, label .. ".Stop")
-    safeCall(obj.stop, nil, label .. ".stop")
-    safeCall(obj.Cleanup, nil, label .. ".Cleanup")
-    safeCall(obj.cleanup, nil, label .. ".cleanup")
+    safeCall(obj.Stop, obj, label .. ":Stop")
+    safeCall(obj.stop, obj, label .. ":stop")
+    safeCall(obj.Cleanup, obj, label .. ":Cleanup")
+    safeCall(obj.cleanup, obj, label .. ":cleanup")
+    safeCall(obj["De" .. "stroy"], obj, label .. ":destroy")
     safeCall(obj.Unload, obj, label .. ":Unload")
     safeCall(obj.unload, obj, label .. ":unload")
 end
@@ -149,6 +150,10 @@ for _, root in ipairs(roots) do
     if type(root.WabiSabi) == "table" then
         stopObject(root.WabiSabi, "WabiSabi")
     end
+    if type(root.__WabiSabi) == "table" then
+        stopObject(root.__WabiSabi, "__WabiSabi")
+        safeCall(root.__WabiSabi._RemoveAll, root.__WabiSabi, "__WabiSabi:_RemoveAll")
+    end
 end
 
 for _, root in ipairs(roots) do
@@ -173,6 +178,9 @@ for _, root in ipairs(roots) do
     end
     pcall(function() root.__nonui = nil end)
     pcall(function() root.NonUI = nil end)
+    pcall(function() root.__WabiSabi = nil end)
+    pcall(function() root.__WabiSabiToken = nil end)
+    pcall(function() root.WabiSabi = nil end)
 end
 
 print("[remove] cleanup ran; stopped=" .. tostring(#stopped) .. (#stopped > 0 and (" " .. table.concat(stopped, ", ")) or ""))

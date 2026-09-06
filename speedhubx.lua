@@ -735,6 +735,10 @@ local function heartbeat()
     end
 end
 
+local wabiLibrary = nil
+local wabiWindow = nil
+local controls = {}
+
 local function stop()
     running = false
     state.AutoFarm = false
@@ -752,6 +756,11 @@ local function stop()
             ui.RemoveTab(TAB_NAME)
         end)
     end
+    if wabiLibrary and type(wabiLibrary["De" .. "stroy"]) == "function" then
+        pcall(function()
+            wabiLibrary["De" .. "stroy"](wabiLibrary)
+        end)
+    end
     print("[" .. SCRIPT_TITLE .. "] stopped")
 end
 
@@ -767,35 +776,206 @@ local api = {
 env[API_KEY] = api
 env.StealAnEgg = api
 
-if ui then
-    pcall(function()
-        ui.RemoveTab(TAB_NAME)
-        ui.RemoveTab(TAB_NAME)
-        ui.AddTab(TAB_NAME, function(tab)
-            local section = tab:Section("Farm", "Left")
-            section:Toggle(ID .. "auto", "Auto Farm", false)
-            if section.Combo then
-                section:Combo(ID .. "filter", "Target", filters, "Total Sweep")
-            end
-            section:Toggle(ID .. "friends", "For Friends", false)
-            section:Toggle(ID .. "feed", "Auto Feed Monster", false)
-            section:SliderFloat(ID .. "speed", "Movement Speed", 150, 1100, state.Speed, "%.0f")
-
-            section = tab:Section("Actions", "Right")
-            section:Toggle(ID .. "noclip", "NoClip", false)
-            section:Toggle(ID .. "antiafk", "Anti Afk", false)
-            section:Button("Scan Once", function()
-                scanOnce()
-            end)
-            section:Button("Stop Script", function()
-                stop()
-            end)
-            section:Tip("Status prints in Matcha logs. API: getfenv()." .. API_KEY .. ".Diag()")
-        end)
-    end)
-else
-    print("[" .. SCRIPT_TITLE .. "] UI unavailable; use getfenv()." .. API_KEY)
+local function getGlobal(name)
+    if env and env[name] ~= nil then return env[name] end
+    if _G and _G[name] ~= nil then return _G[name] end
+    return nil
 end
+
+local function fetchText(url)
+    if type(httpget) == "function" then
+        local ok, data = pcall(function()
+            return httpget(url)
+        end)
+        if ok and type(data) == "string" and #data > 0 then
+            return data, nil
+        end
+    end
+    local ok, data = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(data) == "string" and #data > 0 then
+        return data, nil
+    end
+    return nil, tostring(data)
+end
+
+local function setFilterValue(value)
+    if type(value) == "number" then
+        state.FilterIndex = clamp(value + 1, 1, #filters)
+        return
+    end
+    local text = tostring(value or "")
+    for i, option in ipairs(filters) do
+        if option == text then
+            state.FilterIndex = i
+            return
+        end
+    end
+end
+
+local function setAuto(value)
+    state.AutoFarm = value == true
+    if not state.AutoFarm then
+        releaseKeys()
+        zeroVelocity()
+    end
+    say("Auto Farm", state.AutoFarm and "started" or "stopped", 2)
+end
+
+local function loadWabiSabi()
+    local lib = getGlobal("WabiSabi")
+    if type(lib) == "table" and type(lib.CreateWindow) == "function" then
+        return lib, nil
+    end
+
+    local source, fetchErr = fetchText("https://scripts.wabisabi.mom/wabi-sabi-ui-lib.lua")
+    if not source then
+        return nil, "download failed: " .. tostring(fetchErr)
+    end
+
+    local fn, compileErr = loadstring(source)
+    if type(fn) ~= "function" then
+        return nil, "compile failed: " .. tostring(compileErr)
+    end
+
+    local ok, result = pcall(fn)
+    if ok and type(result) == "table" and type(result.CreateWindow) == "function" then
+        return result, nil
+    end
+
+    lib = getGlobal("WabiSabi")
+    if type(lib) == "table" and type(lib.CreateWindow) == "function" then
+        return lib, nil
+    end
+
+    return nil, "start failed: " .. tostring(result)
+end
+
+local function setupWabiUi()
+    local lib, loadErr = loadWabiSabi()
+    if not lib then
+        print("[" .. SCRIPT_TITLE .. "] UI failed - " .. tostring(loadErr))
+        print("[" .. SCRIPT_TITLE .. "] hotkeys: K auto farm, J scan, API getfenv()." .. API_KEY)
+        return false
+    end
+
+    wabiLibrary = lib
+    local ok, err = pcall(function()
+        wabiWindow = lib:CreateWindow({
+            Title = SCRIPT_TITLE,
+            SubTitle = "Steal An Egg",
+            Size = Vector2.new(560, 430),
+            Resize = true,
+            MinimizeKey = "RightControl",
+        })
+
+        local farmTab = wabiWindow:AddTab({ Title = "Farm" })
+        local farm = farmTab:AddSection("Auto Farm")
+        controls.auto = farm:AddToggle({
+            Id = ID .. "auto",
+            Title = "Auto Farm",
+            Default = false,
+            Callback = function(value)
+                setAuto(value)
+            end,
+        })
+        controls.friends = farm:AddToggle({
+            Id = ID .. "friends",
+            Title = "For Friends",
+            Default = false,
+            Callback = function(value)
+                state.ForFriends = value == true
+            end,
+        })
+        controls.feed = farm:AddToggle({
+            Id = ID .. "feed",
+            Title = "Auto Feed Monster",
+            Default = false,
+            Callback = function(value)
+                state.AutoFeed = value == true
+            end,
+        })
+        farm:AddButton({
+            Title = "Scan Once",
+            Description = "Print best target to Matcha logs",
+            Callback = function()
+                scanOnce()
+            end,
+        })
+
+        local target = farmTab:AddSection("Target")
+        controls.filter = target:AddDropdown({
+            Id = ID .. "filter",
+            Title = "Target Filter",
+            Values = filters,
+            Options = filters,
+            Default = filters[state.FilterIndex],
+            Callback = function(value)
+                setFilterValue(value)
+            end,
+        })
+        controls.speed = target:AddSlider({
+            Id = ID .. "speed",
+            Title = "Movement Speed",
+            Min = 150,
+            Max = 1100,
+            Default = state.Speed,
+            Rounding = 0,
+            Callback = function(value)
+                state.Speed = clamp(value, 150, 1100)
+            end,
+        })
+
+        local miscTab = wabiWindow:AddTab({ Title = "Misc" })
+        local misc = miscTab:AddSection("Runtime")
+        controls.noclip = misc:AddToggle({
+            Id = ID .. "noclip",
+            Title = "NoClip",
+            Default = false,
+            Callback = function(value)
+                state.NoClip = value == true
+            end,
+        })
+        controls.antiafk = misc:AddToggle({
+            Id = ID .. "antiafk",
+            Title = "Anti Afk",
+            Default = false,
+            Callback = function(value)
+                state.AntiAfk = value == true
+            end,
+        })
+        misc:AddButton({
+            Title = "Print Status",
+            Description = "Shows current script state in logs",
+            Callback = function()
+                print("[" .. SCRIPT_TITLE .. "] " .. api.Diag())
+            end,
+        })
+        misc:AddButton({
+            Title = "Stop Script",
+            Description = "Stops movement and loops",
+            Callback = function()
+                stop()
+            end,
+        })
+
+        if type(lib.Notify) == "function" then
+            lib:Notify({ Title = SCRIPT_TITLE, Content = "Loaded. Toggle Auto Farm to start.", Duration = 4 })
+        end
+    end)
+
+    if not ok then
+        print("[" .. SCRIPT_TITLE .. "] UI error - " .. tostring(err))
+        print("[" .. SCRIPT_TITLE .. "] hotkeys: K auto farm, J scan, API getfenv()." .. API_KEY)
+        return false
+    end
+
+    print("[" .. SCRIPT_TITLE .. "] UI ready / RightControl toggles menu")
+    return true
+end
+
+setupWabiUi()
 
 addConn(RunService.Heartbeat:Connect(heartbeat))
 addConn(UserInputService.InputBegan:Connect(function(input)
@@ -804,8 +984,14 @@ addConn(UserInputService.InputBegan:Connect(function(input)
     if key == 74 or key == 106 then
         scanOnce()
     elseif key == 75 or key == 107 then
-        state.AutoFarm = not state.AutoFarm
-        say("Auto Farm", state.AutoFarm and "started" or "stopped", 2)
+        local value = not state.AutoFarm
+        if controls.auto and type(controls.auto.SetValue) == "function" then
+            pcall(function()
+                controls.auto:SetValue(value)
+            end)
+        else
+            setAuto(value)
+        end
     end
 end))
 
